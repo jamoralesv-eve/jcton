@@ -19,7 +19,9 @@ from pr_gate.agent import rebuild_agent
 from pr_gate.agent import required_api_key
 from pr_gate.cli import main
 from pr_gate.cli import report_filename
+from pr_gate.collect import CollectRequest
 from pr_gate.collect import GateInputs
+from pr_gate.collect import gather
 from pr_gate.collect import MAX_DIFF_CHARS
 from pr_gate.collect import branch_ticket_id
 from pr_gate.collect import collect_diff
@@ -45,7 +47,6 @@ GIT_ENV = {
     "GIT_COMMITTER_NAME": "test",
     "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-BODY = "See https://linear.app/acme/issue/ENG-9/login"
 VERDICT = {
     "overall_distance": 0.8,
     "alignment": [
@@ -56,7 +57,6 @@ VERDICT = {
         "factual": 4,
         "conclusions": 3,
         "detail": 2,
-        "tone": 0,
     },
     "justification": "falta un criterio",
     "confidence": "high",
@@ -74,27 +74,17 @@ class TicketResolutionTests(unittest.TestCase):
         with self.assertRaises(TicketNotInBranch):
             branch_ticket_id("main")
 
-    def test_url_in_body(self) -> None:
-        ticket_id = resolve_ticket_id(None, "main", BODY)
-        self.assertEqual(ticket_id, "ENG-9")
-
     def test_explicit_ticket_wins(self) -> None:
-        ticket_id = resolve_ticket_id("lin-2", "alejandro/eng-123-x", BODY)
+        ticket_id = resolve_ticket_id("lin-2", "alejandro/eng-123-x")
         self.assertEqual(ticket_id, "LIN-2")
 
     def test_missing_ticket(self) -> None:
-        with self.assertRaises(GateError):
-            resolve_ticket_id(None, "main", "no link here")
-
-    def test_several_tickets(self) -> None:
-        body = BODY + "\nhttps://linear.app/acme/issue/ENG-10/other"
         with self.assertRaises(GateError) as caught:
-            resolve_ticket_id(None, "main", body)
-        self.assertIn("ENG-9", str(caught.exception))
-        self.assertIn("ENG-10", str(caught.exception))
+            resolve_ticket_id(None, "main")
+        self.assertIn("--ticket", str(caught.exception))
 
-    def test_same_id_in_url_and_branch_is_one_ticket(self) -> None:
-        ticket_id = resolve_ticket_id(None, "alejandro/eng-9-login", BODY)
+    def test_ticket_comes_from_the_branch_name(self) -> None:
+        ticket_id = resolve_ticket_id(None, "alejandro/eng-9-login")
         self.assertEqual(ticket_id, "ENG-9")
 
 
@@ -116,6 +106,28 @@ class DiffTests(unittest.TestCase):
         self.assertIn("app.py", diff)
         self.assertNotIn("package-lock.json", diff)
         self.assertNotIn("yarn.lock", diff)
+
+    def test_branch_change_does_not_need_a_pull_request(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+            _commit_base(directory)
+            _point_origin_head(directory)
+            _git(directory, "checkout", "-b", "alejandro/eng-9-login")
+            _commit_change(directory)
+            inputs = _in_directory(directory, _gather_without_linear)
+        self.assertEqual(inputs.ticket_id, "ENG-9")
+        self.assertEqual(inputs.branch, "alejandro/eng-9-login")
+        self.assertIn("app.py", inputs.diff)
+        self.assertNotIn("package-lock.json", inputs.diff)
+
+    def test_missing_remote_head_raises(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+            _commit_base(directory)
+            _git(directory, "checkout", "-b", "alejandro/eng-9-login")
+            with self.assertRaises(GateError) as caught:
+                _in_directory(directory, lambda: gather(CollectRequest(None, "key")))
+        self.assertIn("origin/HEAD", str(caught.exception))
 
     def test_empty_diff_raises(self) -> None:
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
@@ -239,6 +251,18 @@ class AgentFirewallTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_help_explains_the_command(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as raised:
+                main(["-h"])
+        self.assertEqual(raised.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("usage: jcton", text)
+        self.assertIn("--ticket", text)
+        self.assertIn("--print-inputs", text)
+        self.assertIn("jcton --ticket ENG-123", text)
+
     def test_missing_linear_key(self) -> None:
         with patch.dict(os.environ, {"LINEAR_API_KEY": ""}):
             code, stderr = _quiet(lambda: main(["--print-inputs"]))
@@ -246,7 +270,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("LINEAR_API_KEY", stderr)
 
     def test_print_inputs_skips_the_model(self) -> None:
-        inputs = GateInputs("diff-body", "# ENG-1\n\nbody", "ENG-1", "http://pr", 1)
+        inputs = GateInputs("diff-body", "# ENG-1\n\nbody", "ENG-1", "alejandro/eng-1-login")
         with patch.dict(os.environ, {"LINEAR_API_KEY": "lin_test"}):
             with patch("pr_gate.cli.gather", return_value=inputs):
                 with patch("pr_gate.cli.evaluate") as evaluate:
@@ -264,7 +288,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("ANTHROPIC_API_KEY", stderr)
 
     def test_local_model_skips_provider_key(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
+        inputs = GateInputs("diff", "ticket", "ENG-1", "alejandro/eng-1-login")
         env = {
             "LINEAR_API_KEY": "lin_test",
             "ANTHROPIC_API_KEY": "",
@@ -290,7 +314,7 @@ class CliTests(unittest.TestCase):
         evaluate.assert_not_called()
 
     def test_terminal_renders_the_report(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
+        inputs = GateInputs("diff", "ticket", "ENG-1", "alejandro/eng-1-login")
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
             report = Path(raw) / "report.md"
             code, printed = _run_gate(inputs, VERDICT, report, "0.5")
@@ -302,11 +326,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("pide login", printed)
 
     def test_default_report_names_time_pr_and_ticket(self) -> None:
-        inputs = GateInputs("diff", "ticket", "RND-1695", "http://pr", 1609)
+        inputs = GateInputs("diff", "ticket", "RND-1695", "alejandro/rnd-1695-fix")
         moment = datetime(2026, 10, 29, 13, 37)
         self.assertEqual(
-            report_filename(1609, "RND-1695", moment),
-            "2026-10-29-133700-pr-1609-RND-1695.md",
+            report_filename("alejandro/rnd-1695-fix", "RND-1695", moment),
+            "2026-10-29-133700-alejandro-rnd-1695-fix-RND-1695.md",
         )
 
         async def fake_evaluate(_diff: str, _ticket: str) -> dict:
@@ -329,11 +353,11 @@ class CliTests(unittest.TestCase):
             written = list(directory.glob("*.md"))
         self.assertEqual(code, EXIT_FAIL)
         self.assertEqual([path.name for path in written], [
-            "2026-10-29-133700-pr-1609-RND-1695.md",
+            "2026-10-29-133700-alejandro-rnd-1695-fix-RND-1695.md",
         ])
 
     def test_comparison_is_saved_in_a_temp_folder(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 9)
+        inputs = GateInputs("diff", "ticket", "ENG-1", "alejandro/eng-1-login")
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
             root = Path(raw)
             report = root / "report.md"
@@ -349,7 +373,7 @@ class CliTests(unittest.TestCase):
             self.assertIn(str(saved[0].parent), printed)
 
     def test_distance_above_threshold_writes_report_and_fails(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
+        inputs = GateInputs("diff", "ticket", "ENG-1", "alejandro/eng-1-login")
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
             report = Path(raw) / "report.md"
             code, _printed = _run_gate(inputs, VERDICT, report, "0.5")
@@ -358,7 +382,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("0.80", text)
 
     def test_distance_within_threshold_passes(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
+        inputs = GateInputs("diff", "ticket", "ENG-1", "alejandro/eng-1-login")
         passing = {**VERDICT, "overall_distance": 0.2}
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
             report = Path(raw) / "report.md"
@@ -401,6 +425,15 @@ def _quiet(action):
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         result = action()
     return result, stdout.getvalue() + stderr.getvalue()
+
+
+def _gather_without_linear() -> GateInputs:
+    with patch("pr_gate.collect.fetch_ticket", return_value="# ENG-9\n\nlogin"):
+        return gather(CollectRequest(None, "key"))
+
+
+def _point_origin_head(directory: Path) -> None:
+    _git(directory, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
 
 
 def _commit_base(directory: Path) -> None:

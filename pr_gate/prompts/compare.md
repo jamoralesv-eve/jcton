@@ -13,7 +13,6 @@ Procedure:
    - factual claims
    - conclusions or stance
    - level of detail
-   - tone and intent
 4. Compute the overall distance as a value from 0 to 1, briefly
    justifying how you weighted the dimensions.
 
@@ -25,12 +24,14 @@ Reference scale:
 - 1.0: unrelated or totally contradictory
 
 Rules: base everything on the text, do not invent content, cite short
-fragments as evidence, and flag uncertainty where it exists.
+fragments as evidence, and flag uncertainty where it exists. Grammatical
+tense and plan-versus-reconstruction genre are wording: do not score them
+and do not mention them in the justification.
 
 Respond ONLY with JSON in this form:
 {
   "alignment": [{"a": "...", "b": "...", "relation": "..."}],
-  "dimensions": {"topic": 0, "factual": 0, "conclusions": 0, "detail": 0, "tone": 0},
+  "dimensions": {"topic": 0, "factual": 0, "conclusions": 0, "detail": 0},
   "overall_distance": 0.0,
   "justification": "...",
   "confidence": "high|medium|low"

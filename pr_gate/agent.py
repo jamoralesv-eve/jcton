@@ -35,7 +35,6 @@ class Dimensions(BaseModel):
     factual: int = Field(ge=0, le=10)
     conclusions: int = Field(ge=0, le=10)
     detail: int = Field(ge=0, le=10)
-    tone: int = Field(ge=0, le=10)
 
 
 class Verdict(BaseModel):

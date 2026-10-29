@@ -32,7 +32,7 @@ def exit_code(distance: float, threshold: float) -> int:
     return EXIT_PASS
 
 
-_DIMENSIONS = ("topic", "factual", "conclusions", "detail", "tone")
+_DIMENSIONS = ("topic", "factual", "conclusions", "detail")
 
 
 def render_report(verdict: dict, threshold: float) -> str:

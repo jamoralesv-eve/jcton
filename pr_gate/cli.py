@@ -24,6 +24,29 @@ from pr_gate.decide import render_report
 from pr_gate.errors import GateError
 from pr_gate.run import evaluate
 
+_USAGE = """
+ejemplos:
+  jcton
+  jcton --ticket ENG-123
+  jcton --threshold 0.5 --report reports/custom.md
+  jcton --print-inputs
+
+Corre jcton desde el checkout de la rama a revisar.
+LINEAR_API_KEY es obligatorio. El modelo por defecto también pide ANTHROPIC_API_KEY.
+DISTANCE_THRESHOLD sustituye el umbral de 0.5 cuando se omite --threshold.
+"""
+
+
+class _UsageFormat(
+    argparse.RawDescriptionHelpFormatter,
+    argparse.ArgumentDefaultsHelpFormatter,
+):
+    def _get_help_string(self, action: argparse.Action) -> str:
+        if action.default in (None, False):
+            return action.help or ""
+        return super()._get_help_string(action)
+
+
 def print_header() -> None:
     print(r"""   
                  ___                         ___           ___
@@ -41,9 +64,10 @@ def print_header() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     print_header()
     try:
-        return _execute(_parser().parse_args(argv))
+        return _execute(args)
     except GateError as error:
         return _fail(str(error))
     except Exception as error:
@@ -72,16 +96,21 @@ def _evaluate_pr(args: argparse.Namespace) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pr_gate",
-        description="Compara un PR con su ticket de Linear.",
+        prog="jcton",
+        description="Compara la rama actual con su ticket de Linear.",
+        epilog=_USAGE,
+        formatter_class=_UsageFormat,
     )
-    parser.add_argument("--pr", help="Número del pull request.")
-    parser.add_argument("--repo", help="Repositorio owner/name.")
     parser.add_argument("--ticket", help="Issue de Linear, por ejemplo ENG-123.")
-    parser.add_argument("--threshold", type=float, default=_threshold_from_env())
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=_threshold_from_env(),
+        help="Distancia máxima para aprobar, entre 0 y 1.",
+    )
     parser.add_argument(
         "--report",
-        help="Ruta del reporte. Si se omite, se crea en reports/ con fecha, PR y ticket.",
+        help="Ruta del reporte. Si se omite, se crea en reports/ con fecha, rama y ticket.",
     )
     parser.add_argument(
         "--print-inputs",
@@ -95,8 +124,6 @@ def _gather(args: argparse.Namespace) -> GateInputs:
     return gather(
         CollectRequest(
             ticket_id=args.ticket,
-            pr_number=args.pr,
-            repo=args.repo,
             api_key=_linear_key(),
         )
     )
@@ -104,7 +131,7 @@ def _gather(args: argparse.Namespace) -> GateInputs:
 
 def _print_inputs(inputs: GateInputs) -> None:
     print(f"ticket: {inputs.ticket_id}")
-    print(f"pr: {inputs.pr_url}")
+    print(f"branch: {inputs.branch}")
     print("--- ticket ---")
     print(inputs.ticket)
     print("--- diff ---")
@@ -118,7 +145,7 @@ def _destination(args: argparse.Namespace, inputs: GateInputs) -> Path:
 
 
 def _generated_report(inputs: GateInputs) -> Path:
-    name = report_filename(inputs.pr_number, inputs.ticket_id, datetime.now())
+    name = report_filename(inputs.branch, inputs.ticket_id, datetime.now())
     return _reports_directory() / name
 
 
@@ -128,16 +155,16 @@ def _reports_directory() -> Path:
     return directory
 
 
-def report_filename(pr_number: int, ticket_id: str, moment: datetime) -> str:
+def report_filename(branch: str, ticket_id: str, moment: datetime) -> str:
     stamp = moment.strftime("%Y-%m-%d-%H%M%S")
-    return f"{stamp}-pr-{pr_number}-{_file_token(ticket_id)}.md"
+    return f"{stamp}-{_file_token(branch)}-{_file_token(ticket_id)}.md"
 
 
 def _file_token(value: str) -> str:
-    token = re.sub(r"[^A-Za-z0-9-]", "", value)
+    token = re.sub(r"[^A-Za-z0-9-]", "", value.replace("/", "-"))
     if token:
         return token
-    raise GateError("El ticket no sirve como nombre de archivo")
+        raise GateError("No sirve como nombre de archivo")
 
 
 def _write_and_exit(
@@ -163,7 +190,7 @@ def _save_temp(verdict: dict, report: str, inputs: GateInputs) -> Path:
 
 
 def _temp_folder(inputs: GateInputs) -> Path:
-    name = report_filename(inputs.pr_number, inputs.ticket_id, datetime.now())
+    name = report_filename(inputs.branch, inputs.ticket_id, datetime.now())
     folder = _temp_root() / name.removesuffix(".md")
     folder.mkdir(parents=True, exist_ok=True)
     return folder

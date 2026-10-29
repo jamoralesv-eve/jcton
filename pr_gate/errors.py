@@ -1,5 +1,5 @@
 class GateError(Exception):
-    """The pull request could not be evaluated."""
+    """The branch could not be evaluated."""
 
 
 class TicketNotInBranch(GateError):

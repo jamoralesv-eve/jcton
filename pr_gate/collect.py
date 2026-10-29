@@ -12,10 +12,7 @@ LINEAR_URL = "https://api.linear.app/graphql"
 MAX_DIFF_CHARS = 60_000
 TRUNCATION_NOTE = "\n\n[diff truncated]\n"
 ISSUE_IN_BRANCH = re.compile(r"(?:^|/)([A-Za-z][A-Za-z0-9]+-\d+)(?:-|/|$)")
-ISSUE_URL = re.compile(
-    r"linear\.app/[^/\s]+/issue/([A-Za-z][A-Za-z0-9]+-\d+)",
-    re.IGNORECASE,
-)
+ORIGIN_HEAD = "refs/remotes/origin/HEAD"
 DIFF_EXCLUDES = [
     ":(exclude)*.lock",
     ":(exclude)package-lock.json",
@@ -33,16 +30,6 @@ query Issue($id: String!) {
   }
 }
 """
-PR_FIELDS = "number,body,baseRefName,headRefName,url"
-
-
-@dataclass(frozen=True)
-class PullRequest:
-    number: int
-    body: str
-    base: str
-    head: str
-    url: str
 
 
 @dataclass(frozen=True)
@@ -50,40 +37,30 @@ class GateInputs:
     diff: str
     ticket: str
     ticket_id: str
-    pr_url: str
-    pr_number: int
+    branch: str
 
 
 @dataclass(frozen=True)
 class CollectRequest:
     ticket_id: str | None
-    pr_number: str | None
-    repo: str | None
     api_key: str
 
 
 def gather(request: CollectRequest) -> GateInputs:
-    pull = pull_request(request.pr_number, request.repo)
-    ticket_id = resolve_ticket_id(request.ticket_id, pull.head, pull.body)
+    branch = current_branch()
+    ticket_id = resolve_ticket_id(request.ticket_id, branch)
     return GateInputs(
-        diff=collect_diff(pull.base),
+        diff=collect_diff(default_base()),
         ticket=fetch_ticket(ticket_id, request.api_key),
         ticket_id=ticket_id,
-        pr_url=pull.url,
-        pr_number=pull.number,
+        branch=branch,
     )
 
 
-def resolve_ticket_id(explicit: str | None, branch: str, body: str) -> str:
+def resolve_ticket_id(explicit: str | None, branch: str) -> str:
     if explicit and explicit.strip():
         return explicit.strip().upper()
-    found = _dedupe(_detected(branch, body))
-    if len(found) == 1:
-        return found[0]
-    if not found:
-        raise GateError("El PR no referencia un ticket de Linear")
-    joined = ", ".join(found)
-    raise GateError(f"Hay varios tickets: {joined}. Pasa --ticket.")
+    return _ticket_from_branch(branch)
 
 
 def branch_ticket_id(branch: str) -> str:
@@ -93,8 +70,16 @@ def branch_ticket_id(branch: str) -> str:
     return match.group(1).upper()
 
 
-def tickets_from_body(body: str) -> list[str]:
-    return [match.group(1).upper() for match in ISSUE_URL.finditer(body)]
+def current_branch() -> str:
+    name = _command_output(["git", "branch", "--show-current"]).strip()
+    if name:
+        return name
+    raise GateError("HEAD no está en una rama")
+
+
+def default_base() -> str:
+    ref = _remote_head()
+    return _short_base(ref)
 
 
 def collect_diff(base: str) -> str:
@@ -116,44 +101,30 @@ def fetch_ticket(identifier: str, api_key: str) -> str:
     return f"# {issue['identifier']} {issue['title']}\n\n{description}"
 
 
-def pull_request(number: str | None, repo: str | None) -> PullRequest:
-    payload = json.loads(_command_output(_pr_command(number, repo)))
-    return PullRequest(
-        number=payload["number"],
-        body=payload.get("body") or "",
-        base=payload["baseRefName"],
-        head=payload["headRefName"],
-        url=payload["url"],
-    )
-
-
-def _detected(branch: str, body: str) -> list[str]:
-    found = tickets_from_body(body)
+def _ticket_from_branch(branch: str) -> str:
     try:
-        return [*found, branch_ticket_id(branch)]
-    except TicketNotInBranch:
-        return found
+        return branch_ticket_id(branch)
+    except TicketNotInBranch as error:
+        raise GateError(f"La rama {branch} no tiene un ticket. Pasa --ticket.") from error
 
 
-def _dedupe(identifiers: list[str]) -> list[str]:
-    unique: list[str] = []
-    for identifier in identifiers:
-        if identifier not in unique:
-            unique.append(identifier)
-    return unique
+def _remote_head() -> str:
+    command = ["git", "symbolic-ref", "--short", ORIGIN_HEAD]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise GateError("No está origin/HEAD. El remoto no tiene rama por defecto.")
+    return completed.stdout.strip()
+
+
+def _short_base(ref: str) -> str:
+    remote, _separator, name = ref.partition("/")
+    if remote == "origin" and name:
+        return name
+    raise GateError(f"La base remota no es de origin: {ref}")
 
 
 def _diff_command(base: str) -> list[str]:
     return ["git", "diff", f"origin/{base}...HEAD", "--", ".", *DIFF_EXCLUDES]
-
-
-def _pr_command(number: str | None, repo: str | None) -> list[str]:
-    command = ["gh", "pr", "view", "--json", PR_FIELDS]
-    if number:
-        command.append(number)
-    if repo:
-        command.extend(["--repo", repo])
-    return command
 
 
 def _command_output(command: list[str]) -> str:

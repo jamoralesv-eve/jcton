@@ -1,12 +1,12 @@
 # pr_gate
 
-Command-line check that compares a GitHub pull request with its Linear ticket.
+Command-line check that compares the current branch with its Linear ticket.
 
 Python collects the diff and the real ticket. A two-step agent then scores how far the change is from that ticket. Python, not the model, applies the threshold and exits 0 or 1.
 
 ```
-gh + git + Linear API
-        │  diff and real ticket, no model
+git + Linear API
+        │  branch diff and real ticket, no model
         ▼
 SequentialAgent
         ├─ ticket_rebuilder      writes a ticket from the diff only
@@ -30,7 +30,7 @@ Both agents use LiteLLM at temperature 0, with `include_contents="none"`, so eac
 | Module | Role |
 |---|---|
 | `pr_gate/cli.py` | Arguments, keys, exit codes |
-| `pr_gate/collect.py` | Pull request, filtered diff, Linear ticket |
+| `pr_gate/collect.py` | Current branch diff and Linear ticket |
 | `pr_gate/agent.py` | `LlmAgent`s and the `SequentialAgent` |
 | `pr_gate/prompts.py` | Loads `pr_gate/prompts/*.md`. `{identifier}` is session state; other braces stay literal |
 | `pr_gate/run.py` | `Runner` and an in-memory session |
@@ -38,45 +38,45 @@ Both agents use LiteLLM at temperature 0, with `include_contents="none"`, so eac
 
 `pr_gate/__init__.py` imports the agent module so `adk web` can load `root_agent` later.
 
-## Run
+## Install
 
-From the repository that contains the pull request, with `gh` authenticated:
+Anyone with access to this private repository can install the `jcton` command once:
 
 ```bash
-pip install -r requirements.txt
+uv tool install "git+ssh://git@github.com/jamoralesv-eve/jcton.git"
+```
+
+Without `uv`:
+
+```bash
+pipx install "git+ssh://git@github.com/jamoralesv-eve/jcton.git"
+```
+
+To work on this repository itself:
+
+```bash
+pip install -e .
+```
+
+## Run
+
+From the checkout of the branch to review, `jcton -h` prints the flags and examples:
+
+```bash
 export LINEAR_API_KEY=...
 export ANTHROPIC_API_KEY=...
-python -m pr_gate
+jcton -h
 ```
 
 `ANTHROPIC_API_KEY` is required for the default model. An `ollama` or `ollama_chat` model does not need a provider key. `openai/...` needs `OPENAI_API_KEY`.
 
-Run this from the pull request checkout. If that checkout is not this repository, set `PYTHONPATH` to this repository so `python -m pr_gate` can import the package.
-
-The command uses the open pull request for the current branch. It writes `reports/<fecha>-pr-<número>-<ticket>.md` and prints the same report. `--report` sets a different path. The comparison JSON and a copy of the report also go to a folder under the system temp directory, `$TMPDIR/pr_gate/<fecha>-pr-<número>-<ticket>/`.
-
-```bash
-python -m pr_gate --pr 123 --repo owner/name
-python -m pr_gate --ticket ENG-123
-python -m pr_gate --threshold 0.5 --report reports/custom.md
-python -m pr_gate --print-inputs
-```
-
-`--print-inputs` prints the ticket and the diff, then exits. It does not call the model.
-
-`DISTANCE_THRESHOLD` overrides the default threshold of `0.5` when `--threshold` is omitted.
+The diff is the change on the current branch against the remote default branch (`origin/HEAD`). It writes `reports/<fecha>-<rama>-<ticket>.md` and prints the same report. `--report` sets a different path. The comparison JSON and a copy of the report also go to `$TMPDIR/pr_gate/<fecha>-<rama>-<ticket>/`.
 
 ## What gets collected
 
-`gh pr view` supplies the pull request body, base branch, and head branch. The diff is `git diff origin/<base>...HEAD`, excluding lockfiles and `*.snap`, and cut at 60,000 characters.
+The diff is `git diff origin/<default>...HEAD`, excluding lockfiles and `*.snap`, and cut at 60,000 characters. `<default>` is the branch `origin/HEAD` points at.
 
-The Linear issue id is resolved in this order:
-
-1. `--ticket`
-2. A `linear.app/<workspace>/issue/ENG-123` URL in the pull request body
-3. The head branch name, for example `alejandro/eng-123-title`
-
-One id is required. Several ids stop the run until `--ticket` picks one. The ticket text is the Linear title plus description, loaded with the GraphQL `issue(id:)` query. Issue comments are not included.
+The Linear issue id comes from `--ticket`, or from the current branch name, for example `alejandro/eng-123-title`. A branch without an id needs `--ticket`. The ticket text is the Linear title plus description, loaded with the GraphQL `issue(id:)` query. Issue comments are not included.
 
 ## Tests
 
