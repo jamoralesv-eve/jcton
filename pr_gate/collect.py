@@ -51,6 +51,7 @@ class GateInputs:
     ticket: str
     ticket_id: str
     pr_url: str
+    pr_number: int
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ def gather(request: CollectRequest) -> GateInputs:
         ticket=fetch_ticket(ticket_id, request.api_key),
         ticket_id=ticket_id,
         pr_url=pull.url,
+        pr_number=pull.number,
     )
 
 

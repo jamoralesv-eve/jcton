@@ -1,9 +1,18 @@
 import argparse
 import asyncio
+import json
 import os
+import re
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
+from rich.console import Console
+from rich.markdown import Markdown
+
+from pr_gate.agent import model_name
+from pr_gate.agent import required_api_key
 from pr_gate.collect import CollectRequest
 from pr_gate.collect import GateInputs
 from pr_gate.collect import gather
@@ -15,8 +24,24 @@ from pr_gate.decide import render_report
 from pr_gate.errors import GateError
 from pr_gate.run import evaluate
 
+def print_header() -> None:
+    print(r"""   
+                 ___                         ___           ___
+    ___         /\__\                       /\  \         /\  \
+   /\__\       /:/  /          ___         /::\  \        \:\  \
+  /:/__/      /:/  /          /\__\       /:/\:\  \        \:\  \
+ /::\  \     /:/  /  ___     /:/  /      /:/  \:\  \   _____\:\  \
+ \/\:\  \   /:/__/  /\__\   /:/__/      /:/__/ \:\__\ /::::::::\__\
+  ~~\:\  \  \:\  \ /:/  /  /::\  \      \:\  \ /:/  / \:\~~\~~\/__/
+     \:\__\  \:\  /:/  /  /:/\:\  \      \:\  /:/  /   \:\  \
+     /:/  /   \:\/:/  /   \/__\:\  \      \:\/:/  /     \:\  \
+    /:/  /     \::/  /         \:\__\      \::/  /       \:\__\
+    \/__/       \/__/           \/__/       \/__/         \/__/
+""")
+
 
 def main(argv: list[str] | None = None) -> int:
+    print_header()
     try:
         return _execute(_parser().parse_args(argv))
     except GateError as error:
@@ -41,7 +66,8 @@ def _evaluate_pr(args: argparse.Namespace) -> int:
     _require_model_key()
     inputs = _gather(args)
     verdict = asyncio.run(evaluate(inputs.diff, inputs.ticket))
-    return _write_and_exit(verdict, threshold, Path(args.report))
+    report_path = _destination(args, inputs)
+    return _write_and_exit(verdict, threshold, report_path, inputs)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -53,7 +79,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", help="Repositorio owner/name.")
     parser.add_argument("--ticket", help="Issue de Linear, por ejemplo ENG-123.")
     parser.add_argument("--threshold", type=float, default=_threshold_from_env())
-    parser.add_argument("--report", default="report.md")
+    parser.add_argument(
+        "--report",
+        help="Ruta del reporte. Si se omite, se crea en reports/ con fecha, PR y ticket.",
+    )
     parser.add_argument(
         "--print-inputs",
         action="store_true",
@@ -82,11 +111,75 @@ def _print_inputs(inputs: GateInputs) -> None:
     print(inputs.diff)
 
 
-def _write_and_exit(verdict: dict, threshold: float, report_path: Path) -> int:
+def _destination(args: argparse.Namespace, inputs: GateInputs) -> Path:
+    if args.report:
+        return Path(args.report)
+    return _generated_report(inputs)
+
+
+def _generated_report(inputs: GateInputs) -> Path:
+    name = report_filename(inputs.pr_number, inputs.ticket_id, datetime.now())
+    return _reports_directory() / name
+
+
+def _reports_directory() -> Path:
+    directory = Path(__file__).resolve().parents[1] / "reports"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def report_filename(pr_number: int, ticket_id: str, moment: datetime) -> str:
+    stamp = moment.strftime("%Y-%m-%d-%H%M%S")
+    return f"{stamp}-pr-{pr_number}-{_file_token(ticket_id)}.md"
+
+
+def _file_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9-]", "", value)
+    if token:
+        return token
+    raise GateError("El ticket no sirve como nombre de archivo")
+
+
+def _write_and_exit(
+    verdict: dict,
+    threshold: float,
+    report_path: Path,
+    inputs: GateInputs,
+) -> int:
     report = render_report(verdict, threshold)
     report_path.write_text(report)
-    print(report, end="")
+    folder = _save_temp(verdict, report, inputs)
+    print(report_path)
+    print(folder)
+    _show_report(report)
     return exit_code(distance_of(verdict), threshold)
+
+
+def _save_temp(verdict: dict, report: str, inputs: GateInputs) -> Path:
+    folder = _temp_folder(inputs)
+    _write_json(folder / "comparison.json", verdict)
+    (folder / "report.md").write_text(report)
+    return folder
+
+
+def _temp_folder(inputs: GateInputs) -> Path:
+    name = report_filename(inputs.pr_number, inputs.ticket_id, datetime.now())
+    folder = _temp_root() / name.removesuffix(".md")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _temp_root() -> Path:
+    return Path(tempfile.gettempdir()) / "pr_gate"
+
+
+def _write_json(path: Path, verdict: dict) -> None:
+    text = json.dumps(verdict, ensure_ascii=False, indent=2) + "\n"
+    path.write_text(text)
+
+
+def _show_report(report: str) -> None:
+    Console().print(Markdown(report))
 
 
 def _linear_key() -> str:
@@ -97,9 +190,16 @@ def _linear_key() -> str:
 
 
 def _require_model_key() -> None:
-    if os.environ.get("GOOGLE_API_KEY", "").strip():
+    key = required_api_key(model_name())
+    if _key_present(key):
         return
-    raise GateError("Falta GOOGLE_API_KEY")
+    raise GateError(f"Falta {key}")
+
+
+def _key_present(key: str) -> bool:
+    if not key:
+        return True
+    return bool(os.environ.get(key, "").strip())
 
 
 def _threshold_from_env() -> float:

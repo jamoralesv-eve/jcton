@@ -2,16 +2,23 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
 import urllib.error
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from pr_gate.agent import DEFAULT_MODEL
 from pr_gate.agent import compare_agent
+from pr_gate.agent import gate_model
+from pr_gate.agent import model_name
 from pr_gate.agent import rebuild_agent
+from pr_gate.agent import required_api_key
 from pr_gate.cli import main
+from pr_gate.cli import report_filename
 from pr_gate.collect import GateInputs
 from pr_gate.collect import MAX_DIFF_CHARS
 from pr_gate.collect import branch_ticket_id
@@ -41,8 +48,16 @@ GIT_ENV = {
 BODY = "See https://linear.app/acme/issue/ENG-9/login"
 VERDICT = {
     "overall_distance": 0.8,
-    "missing_in_pr": ["criterio de login"],
-    "unrequested_changes": [],
+    "alignment": [
+        {"a": "pide login", "b": "agrega login", "relation": "partial"},
+    ],
+    "dimensions": {
+        "topic": 1,
+        "factual": 4,
+        "conclusions": 3,
+        "detail": 2,
+        "tone": 0,
+    },
     "justification": "falta un criterio",
     "confidence": "high",
 }
@@ -152,17 +167,65 @@ class DecisionTests(unittest.TestCase):
         parsed = as_verdict(json.dumps(VERDICT))
         self.assertEqual(parsed["overall_distance"], 0.8)
 
-    def test_report_lists_missing_requirement(self) -> None:
+    def test_report_prints_comparison_tables(self) -> None:
         report = render_report(VERDICT, 0.5)
         self.assertIn("**Distancia:** 0.80", report)
-        self.assertIn("criterio de login", report)
-        self.assertIn("- ninguno", report)
+        self.assertIn("| pide login | agrega login | partial |", report)
+        self.assertIn("| factual | 4 |", report)
+        self.assertIn("falta un criterio", report)
+
+    def test_report_escapes_table_pipes(self) -> None:
+        verdict = {
+            **VERDICT,
+            "alignment": [{"a": "a|b", "b": "c", "relation": "equivalent"}],
+        }
+        report = render_report(verdict, 0.5)
+        self.assertIn(r"| a\|b | c | equivalent |", report)
+
+    def test_report_requires_alignment(self) -> None:
+        verdict = {key: value for key, value in VERDICT.items() if key != "alignment"}
+        with self.assertRaises(GateError):
+            render_report(verdict, 0.5)
+
+
+_STATE_PLACEHOLDER = re.compile(r"(?<![\$\{\\])\{+([^{}]+)\}+")
+
+
+class ModelSelectionTests(unittest.TestCase):
+    def test_default_model_is_anthropic(self) -> None:
+        with patch.dict(os.environ, {"PR_GATE_MODEL": ""}):
+            self.assertEqual(model_name(), DEFAULT_MODEL)
+            self.assertEqual(required_api_key(DEFAULT_MODEL), "ANTHROPIC_API_KEY")
+
+    def test_openai_compatible_model_needs_openai_key(self) -> None:
+        with patch.dict(os.environ, {"PR_GATE_MODEL": "openai/qwen-coder"}):
+            self.assertEqual(model_name(), "openai/qwen-coder")
+            self.assertEqual(required_api_key(model_name()), "OPENAI_API_KEY")
+
+    def test_api_base_is_passed_to_the_model(self) -> None:
+        env = {
+            "PR_GATE_MODEL": "openai/qwen-coder",
+            "PR_GATE_API_BASE": "http://localhost:8000/v1",
+        }
+        with patch.dict(os.environ, env):
+            model = gate_model()
+        self.assertEqual(model.model, "openai/qwen-coder")
+        self.assertEqual(model._additional_args["api_base"], "http://localhost:8000/v1")
 
 
 class AgentFirewallTests(unittest.TestCase):
-    def test_prompts_have_no_template_braces(self) -> None:
-        self.assertNotIn("{", REBUILD_PROMPT)
-        self.assertNotIn("{", COMPARE_PROMPT)
+    def test_prompts_come_from_markdown(self) -> None:
+        directory = REPO / "pr_gate" / "prompts"
+        rebuild = (directory / "rebuild.md").read_text(encoding="utf-8").strip()
+        compare = (directory / "compare.md").read_text(encoding="utf-8").strip()
+        self.assertEqual(REBUILD_PROMPT, rebuild)
+        self.assertEqual(COMPARE_PROMPT, compare)
+
+    def test_prompts_have_no_session_placeholders(self) -> None:
+        for prompt in (REBUILD_PROMPT, COMPARE_PROMPT):
+            for match in _STATE_PLACEHOLDER.finditer(prompt):
+                name = match.group(1).strip().removesuffix("?")
+                self.assertFalse(name.isidentifier(), name)
 
     def test_rebuilder_sees_only_the_diff(self) -> None:
         self.assertIn("{pr_diff}", rebuild_agent.instruction)
@@ -183,7 +246,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("LINEAR_API_KEY", stderr)
 
     def test_print_inputs_skips_the_model(self) -> None:
-        inputs = GateInputs("diff-body", "# ENG-1\n\nbody", "ENG-1", "http://pr")
+        inputs = GateInputs("diff-body", "# ENG-1\n\nbody", "ENG-1", "http://pr", 1)
         with patch.dict(os.environ, {"LINEAR_API_KEY": "lin_test"}):
             with patch("pr_gate.cli.gather", return_value=inputs):
                 with patch("pr_gate.cli.evaluate") as evaluate:
@@ -193,6 +256,32 @@ class CliTests(unittest.TestCase):
         self.assertIn("diff-body", stdout)
         evaluate.assert_not_called()
 
+    def test_missing_anthropic_key(self) -> None:
+        env = {"ANTHROPIC_API_KEY": "", "PR_GATE_MODEL": ""}
+        with patch.dict(os.environ, env):
+            code, stderr = _quiet(lambda: main([]))
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("ANTHROPIC_API_KEY", stderr)
+
+    def test_local_model_skips_provider_key(self) -> None:
+        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
+        env = {
+            "LINEAR_API_KEY": "lin_test",
+            "ANTHROPIC_API_KEY": "",
+            "PR_GATE_MODEL": "ollama_chat/qwen2.5-coder",
+        }
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            report = Path(raw) / "report.md"
+            code, _printed = _run_gate(inputs, VERDICT, report, "0.5", env)
+        self.assertEqual(code, EXIT_FAIL)
+
+    def test_unknown_provider_stops(self) -> None:
+        env = {"PR_GATE_MODEL": "mystery/model", "ANTHROPIC_API_KEY": "x"}
+        with patch.dict(os.environ, env):
+            code, stderr = _quiet(lambda: main([]))
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("Proveedor no soportado", stderr)
+
     def test_bad_threshold_stops_before_the_model(self) -> None:
         with patch("pr_gate.cli.evaluate") as evaluate:
             code, stderr = _quiet(lambda: main(["--threshold", "2"]))
@@ -200,21 +289,80 @@ class CliTests(unittest.TestCase):
         self.assertIn("umbral", stderr)
         evaluate.assert_not_called()
 
-    def test_distance_above_threshold_writes_report_and_fails(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr")
+    def test_terminal_renders_the_report(self) -> None:
+        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
             report = Path(raw) / "report.md"
-            code = _run_gate(inputs, VERDICT, report, "0.5")
+            code, printed = _run_gate(inputs, VERDICT, report, "0.5")
+            saved = report.read_text()
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("**Distancia:**", saved)
+        self.assertNotIn("**Distancia:**", printed)
+        self.assertIn("0.80", printed)
+        self.assertIn("pide login", printed)
+
+    def test_default_report_names_time_pr_and_ticket(self) -> None:
+        inputs = GateInputs("diff", "ticket", "RND-1695", "http://pr", 1609)
+        moment = datetime(2026, 10, 29, 13, 37)
+        self.assertEqual(
+            report_filename(1609, "RND-1695", moment),
+            "2026-10-29-133700-pr-1609-RND-1695.md",
+        )
+
+        async def fake_evaluate(_diff: str, _ticket: str) -> dict:
+            return VERDICT
+
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+
+            def run() -> int:
+                env = {"LINEAR_API_KEY": "lin_test", "ANTHROPIC_API_KEY": "key"}
+                with patch.dict(os.environ, env):
+                    with patch("pr_gate.cli.gather", return_value=inputs):
+                        with patch("pr_gate.cli.evaluate", fake_evaluate):
+                            with patch("pr_gate.cli._reports_directory", return_value=directory):
+                                with patch("pr_gate.cli.datetime") as clock:
+                                    clock.now.return_value = moment
+                                    return main([])
+
+            code, _printed = _quiet(run)
+            written = list(directory.glob("*.md"))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertEqual([path.name for path in written], [
+            "2026-10-29-133700-pr-1609-RND-1695.md",
+        ])
+
+    def test_comparison_is_saved_in_a_temp_folder(self) -> None:
+        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 9)
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            root = Path(raw)
+            report = root / "report.md"
+            with patch("pr_gate.cli._temp_root", return_value=root / "tmp"):
+                code, printed = _run_gate(inputs, VERDICT, report, "0.5")
+            saved = list((root / "tmp").rglob("comparison.json"))
+            payload = json.loads(saved[0].read_text())
+            copy = (saved[0].parent / "report.md").read_text()
+            self.assertEqual(code, EXIT_FAIL)
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(payload["overall_distance"], 0.8)
+            self.assertEqual(copy, report.read_text())
+            self.assertIn(str(saved[0].parent), printed)
+
+    def test_distance_above_threshold_writes_report_and_fails(self) -> None:
+        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            report = Path(raw) / "report.md"
+            code, _printed = _run_gate(inputs, VERDICT, report, "0.5")
             text = report.read_text()
         self.assertEqual(code, EXIT_FAIL)
         self.assertIn("0.80", text)
 
     def test_distance_within_threshold_passes(self) -> None:
-        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr")
+        inputs = GateInputs("diff", "ticket", "ENG-1", "http://pr", 1)
         passing = {**VERDICT, "overall_distance": 0.2}
         with tempfile.TemporaryDirectory(dir=REPO) as raw:
             report = Path(raw) / "report.md"
-            code = _run_gate(inputs, passing, report, "0.5")
+            code, _printed = _run_gate(inputs, passing, report, "0.5")
         self.assertEqual(code, EXIT_PASS)
 
 
@@ -225,8 +373,15 @@ def _fetch(payload: dict) -> str:
         return fetch_ticket("ENG-1", "key")
 
 
-def _run_gate(inputs: GateInputs, verdict: dict, report: Path, threshold: str) -> int:
-    env = {"LINEAR_API_KEY": "lin_test", "GOOGLE_API_KEY": "google_test"}
+def _run_gate(
+    inputs: GateInputs,
+    verdict: dict,
+    report: Path,
+    threshold: str,
+    env: dict | None = None,
+) -> tuple[int, str]:
+    if env is None:
+        env = {"LINEAR_API_KEY": "lin_test", "ANTHROPIC_API_KEY": "anthropic_test"}
 
     async def fake_evaluate(_diff: str, _ticket: str) -> dict:
         return verdict
@@ -237,8 +392,7 @@ def _run_gate(inputs: GateInputs, verdict: dict, report: Path, threshold: str) -
                 with patch("pr_gate.cli.evaluate", fake_evaluate):
                     return main(["--threshold", threshold, "--report", str(report)])
 
-    code, _stdout = _quiet(run)
-    return code
+    return _quiet(run)
 
 
 def _quiet(action):
