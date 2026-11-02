@@ -27,6 +27,7 @@ from pr_gate.collect import branch_ticket_id
 from pr_gate.collect import collect_diff
 from pr_gate.collect import fetch_ticket
 from pr_gate.collect import limit_diff
+from pr_gate.collect import current_branch
 from pr_gate.collect import resolve_ticket_id
 from pr_gate.decide import EXIT_ERROR
 from pr_gate.decide import EXIT_FAIL
@@ -38,6 +39,10 @@ from pr_gate.errors import GateError
 from pr_gate.errors import TicketNotInBranch
 from pr_gate.prompts import COMPARE_PROMPT
 from pr_gate.prompts import REBUILD_PROMPT
+from pr_gate.pull_request import PreparedReview
+from pr_gate.pull_request import parse_link
+from pr_gate.pull_request import prepare_pull_request
+from pr_gate.pull_request import ticket_from_branch
 
 REPO = Path(__file__).resolve().parents[1]
 GIT_ENV = {
@@ -182,7 +187,11 @@ class DecisionTests(unittest.TestCase):
     def test_report_prints_comparison_tables(self) -> None:
         report = render_report(VERDICT, 0.5)
         self.assertIn("**Distancia:** 0.80", report)
+        self.assertIn("**Documento A** es el ticket real de Linear", report)
+        self.assertIn("**Documento B** se construye solo con el diff", report)
+        self.assertIn("https://github.com/jamoralesv-eve/jcton/tree/main/pr_gate/prompts", report)
         self.assertIn("| pide login | agrega login | partial |", report)
+        self.assertIn("Documento B (reconstruido del diff)", report)
         self.assertIn("| factual | 4 |", report)
         self.assertIn("falta un criterio", report)
 
@@ -262,6 +271,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("--ticket", text)
         self.assertIn("--print-inputs", text)
         self.assertIn("jcton --ticket ENG-123", text)
+        self.assertIn("https://github.com/org/repo/pull/123", text)
 
     def test_missing_linear_key(self) -> None:
         with patch.dict(os.environ, {"LINEAR_API_KEY": ""}):
@@ -272,13 +282,15 @@ class CliTests(unittest.TestCase):
     def test_print_inputs_skips_the_model(self) -> None:
         inputs = GateInputs("diff-body", "# ENG-1\n\nbody", "ENG-1", "alejandro/eng-1-login")
         with patch.dict(os.environ, {"LINEAR_API_KEY": "lin_test"}):
-            with patch("pr_gate.cli.gather", return_value=inputs):
-                with patch("pr_gate.cli.evaluate") as evaluate:
-                    code, stdout = _quiet(lambda: main(["--print-inputs"]))
+            with patch("pr_gate.cli.prepare_pull_request") as prepare:
+                with patch("pr_gate.cli.gather", return_value=inputs):
+                    with patch("pr_gate.cli.evaluate") as evaluate:
+                        code, stdout = _quiet(lambda: main(["--print-inputs"]))
         self.assertEqual(code, EXIT_PASS)
         self.assertIn("ENG-1", stdout)
         self.assertIn("diff-body", stdout)
         evaluate.assert_not_called()
+        prepare.assert_not_called()
 
     def test_missing_anthropic_key(self) -> None:
         env = {"ANTHROPIC_API_KEY": "", "PR_GATE_MODEL": ""}
@@ -389,6 +401,121 @@ class CliTests(unittest.TestCase):
             code, _printed = _run_gate(inputs, passing, report, "0.5")
         self.assertEqual(code, EXIT_PASS)
 
+    def test_pull_request_link_sets_the_ticket(self) -> None:
+        url = "https://github.com/acme/app/pull/7"
+        prepared = PreparedReview("ENG-42", "alejandro/eng-42-login")
+        inputs = GateInputs("diff-body", "# ENG-42\n\nbody", "ENG-42", prepared.branch)
+        with patch.dict(os.environ, {"LINEAR_API_KEY": "lin_test"}):
+            with patch("pr_gate.cli.prepare_pull_request", return_value=prepared) as prepare:
+                with patch("pr_gate.cli.gather", return_value=inputs) as gathered:
+                    code, printed = _quiet(lambda: main([url, "--print-inputs"]))
+        self.assertEqual(code, EXIT_PASS)
+        prepare.assert_called_once_with(url)
+        self.assertEqual(gathered.call_args.args[0].ticket_id, "ENG-42")
+        self.assertIn("branch: alejandro/eng-42-login", printed)
+        self.assertIn("ticket: ENG-42", printed)
+        self.assertIn("diff-body", printed)
+
+    def test_explicit_ticket_overrides_the_pull_request_title(self) -> None:
+        url = "https://github.com/acme/app/pull/7"
+        prepared = PreparedReview("ENG-42", "alejandro/eng-42-login")
+        inputs = GateInputs("diff-body", "# LIN-2\n\nbody", "LIN-2", prepared.branch)
+        with patch.dict(os.environ, {"LINEAR_API_KEY": "lin_test"}):
+            with patch("pr_gate.cli.prepare_pull_request", return_value=prepared):
+                with patch("pr_gate.cli.gather", return_value=inputs) as gathered:
+                    code, _printed = _quiet(lambda: main([url, "--ticket", "lin-2", "--print-inputs"]))
+        self.assertEqual(code, EXIT_PASS)
+        self.assertEqual(gathered.call_args.args[0].ticket_id, "LIN-2")
+
+    def test_bad_pull_request_link_stops(self) -> None:
+        code, printed = _quiet(lambda: main(["https://github.com/acme/app/issues/7"]))
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("pull request", printed)
+
+
+class PullRequestTests(unittest.TestCase):
+    def test_parse_link_reads_owner_repo_and_number(self) -> None:
+        link = parse_link("https://github.com/acme/app.js/pull/7/files?w=1")
+        self.assertEqual(link.owner, "acme")
+        self.assertEqual(link.repo, "app.js")
+        self.assertEqual(link.number, 7)
+
+    def test_parse_link_rejects_other_urls(self) -> None:
+        with self.assertRaises(GateError) as caught:
+            parse_link("https://github.com/acme/app/issues/7")
+        self.assertIn("pull request", str(caught.exception))
+
+    def test_ticket_from_a_branch_name(self) -> None:
+        spaced = "Emanuel/rnd 1644 block an agent in crowdstrike from the actions tab"
+        self.assertEqual(ticket_from_branch(spaced), "RND-1644")
+        self.assertEqual(ticket_from_branch("alejandro/rnd-1644-block-agent"), "RND-1644")
+
+    def test_first_ticket_in_the_branch_wins(self) -> None:
+        self.assertEqual(ticket_from_branch("rnd-1111-and-eng-2222"), "RND-1111")
+
+    def test_branch_without_four_digits_raises(self) -> None:
+        with self.assertRaises(GateError) as caught:
+            ticket_from_branch("alejandro/eng-42-login")
+        self.assertIn("rama", str(caught.exception))
+
+    def test_checkout_uses_the_ticket_from_the_branch(self) -> None:
+        url = "https://github.com/acme/app/pull/7"
+        branch_name = "alejandro/rnd-1644-login"
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+            _commit_base(directory)
+            _point_origin_head(directory)
+            _git(directory, "checkout", "-b", branch_name)
+            _commit_change(directory)
+            _git(directory, "checkout", "main")
+            bin_dir = _install_gh(directory, _checkout_script(branch_name, "Add login"))
+            code, printed = _in_directory(directory, lambda: _review_link(directory, bin_dir, url))
+            branch = _in_directory(directory, current_branch)
+            log = (directory / "gh.log").read_text()
+        self.assertEqual(code, EXIT_PASS)
+        self.assertEqual(branch, branch_name)
+        self.assertIn("ticket: RND-1644", printed)
+        self.assertIn("app.py", printed)
+        self.assertLess(log.index("pr view"), log.index("pr checkout"))
+
+    def test_branch_without_a_ticket_does_not_checkout(self) -> None:
+        url = "https://github.com/acme/app/pull/7"
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+            _commit_base(directory)
+            bin_dir = _install_gh(directory, _checkout_script("main", "Add login"))
+            with self.assertRaises(GateError):
+                _in_directory(directory, lambda: _call_prepare(directory, bin_dir, url))
+            branch = _in_directory(directory, current_branch)
+            log = (directory / "gh.log").read_text()
+        self.assertEqual(branch, "main")
+        self.assertNotIn("pr checkout", log)
+
+    def test_missing_gh_command(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            with patch.dict(os.environ, {"PATH": raw}):
+                with self.assertRaises(GateError) as caught:
+                    prepare_pull_request("https://github.com/acme/app/pull/7")
+        self.assertIn("gh", str(caught.exception))
+
+    def test_gh_error_is_reported(self) -> None:
+        script = "#!/bin/sh\necho 'no such pull request' >&2\nexit 1\n"
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+            bin_dir = _install_gh(directory, script)
+            with self.assertRaises(GateError) as caught:
+                _in_directory(directory, lambda: _call_prepare(directory, bin_dir, "https://github.com/acme/app/pull/7"))
+        self.assertIn("no such pull request", str(caught.exception))
+
+    def test_gh_must_return_json(self) -> None:
+        script = "#!/bin/sh\necho not-json\nexit 0\n"
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            directory = Path(raw)
+            bin_dir = _install_gh(directory, script)
+            with self.assertRaises(GateError) as caught:
+                _in_directory(directory, lambda: _call_prepare(directory, bin_dir, "https://github.com/acme/app/pull/7"))
+        self.assertIn("JSON", str(caught.exception))
+
 
 def _fetch(payload: dict) -> str:
     raw = io.BytesIO(json.dumps(payload).encode())
@@ -461,6 +588,56 @@ def _git(directory: Path, *args: str) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def _review_link(directory: Path, bin_dir: Path, url: str) -> tuple[int, str]:
+    def run() -> int:
+        with _gh_env(directory, bin_dir):
+            with patch("pr_gate.collect.fetch_ticket", return_value="# ENG-42\n\nlogin"):
+                return main([url, "--print-inputs"])
+
+    return _quiet(run)
+
+
+def _call_prepare(directory: Path, bin_dir: Path, url: str) -> PreparedReview:
+    with _gh_env(directory, bin_dir):
+        return prepare_pull_request(url)
+
+
+def _gh_env(directory: Path, bin_dir: Path):
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["GH_LOG"] = str(directory / "gh.log")
+    env["LINEAR_API_KEY"] = "lin_test"
+    return patch.dict(os.environ, env)
+
+
+def _install_gh(directory: Path, script: str) -> Path:
+    bin_dir = directory / "bin"
+    bin_dir.mkdir()
+    command = bin_dir / "gh"
+    command.write_text(script)
+    command.chmod(0o755)
+    return bin_dir
+
+
+def _checkout_script(branch: str, title: str) -> str:
+    payload = json.dumps({"title": title, "headRefName": branch})
+    return "\n".join([
+        "#!/bin/sh",
+        "printf '%s\\n' \"$*\" >> \"$GH_LOG\"",
+        "if [ \"$1\" = pr ] && [ \"$2\" = view ]; then",
+        f"  printf '%s\\n' '{payload}'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = pr ] && [ \"$2\" = checkout ]; then",
+        f"  git checkout {branch}",
+        "  exit $?",
+        "fi",
+        "echo unexpected >&2",
+        "exit 1",
+        "",
+    ])
 
 
 def _in_directory(directory: Path, action):

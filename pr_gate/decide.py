@@ -33,16 +33,27 @@ def exit_code(distance: float, threshold: float) -> int:
 
 
 _DIMENSIONS = ("topic", "factual", "conclusions", "detail")
+PROMPTS_URL = "https://github.com/jamoralesv-eve/jcton/tree/main/pr_gate/prompts"
 
 
 def render_report(verdict: dict, threshold: float) -> str:
     blocks = [
         _heading(verdict, threshold),
+        _sources(),
         _alignment_table(verdict),
         _dimensions_table(verdict),
         _justification(verdict),
     ]
     return "\n\n".join(blocks) + "\n"
+
+
+def _sources() -> str:
+    return "\n".join([
+        "**Documento A** es el ticket real de Linear: título y descripción. No sale del diff.",
+        "**Documento B** se construye solo con el diff, usando `rebuild.md`. Ese paso no ve el ticket.",
+        "La comparación usa `compare.md`.",
+        f"Prompts: {PROMPTS_URL}",
+    ])
 
 
 def _heading(verdict: dict, threshold: float) -> str:
@@ -58,7 +69,7 @@ def _heading(verdict: dict, threshold: float) -> str:
 
 def _alignment_table(verdict: dict) -> str:
     rows = [_alignment_cells(item) for item in _alignment(verdict)]
-    table = _table(["Documento A", "Documento B", "Relación"], rows)
+    table = _table(["Documento A (ticket de Linear)", "Documento B (reconstruido del diff)", "Relación"], rows)
     return "## Alineación\n\n" + table
 
 

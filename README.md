@@ -68,6 +68,14 @@ export ANTHROPIC_API_KEY=...
 jcton -h
 ```
 
+To review a GitHub pull request, run `jcton` from a clone of that repository and pass the link. `jcton` reads the head branch with `gh`, takes the Linear issue id from that name, checks out the branch, and then runs the same comparison. The id is three letters, a hyphen or a space, and four digits, for example `rnd-1644` or `rnd 1644`, and it is normalized to `RND-1644`:
+
+```bash
+jcton https://github.com/org/repo/pull/123
+```
+
+`--ticket` still overrides the id from the branch name. `--print-inputs` checks out the branch and prints the diff and the ticket without calling the model. This path needs the `gh` command, authenticated for that repository.
+
 `ANTHROPIC_API_KEY` is required for the default model. An `ollama` or `ollama_chat` model does not need a provider key. `openai/...` needs `OPENAI_API_KEY`.
 
 The diff is the change on the current branch against the remote default branch (`origin/HEAD`). It writes `reports/<fecha>-<rama>-<ticket>.md` and prints the same report. `--report` sets a different path. The comparison JSON and a copy of the report also go to `$TMPDIR/pr_gate/<fecha>-<rama>-<ticket>/`.
@@ -76,7 +84,7 @@ The diff is the change on the current branch against the remote default branch (
 
 The diff is `git diff origin/<default>...HEAD`, excluding lockfiles and `*.snap`, and cut at 60,000 characters. `<default>` is the branch `origin/HEAD` points at.
 
-The Linear issue id comes from `--ticket`, or from the current branch name, for example `alejandro/eng-123-title`. A branch without an id needs `--ticket`. The ticket text is the Linear title plus description, loaded with the GraphQL `issue(id:)` query. Issue comments are not included.
+When a link is passed, the Linear issue id comes from the pull request branch name: three letters, a hyphen or a space, and four digits, such as `emanuel/rnd-1644-block-agent` or `emanuel/rnd 1644 block agent`. Otherwise it comes from `--ticket`, or from the current branch name, for example `alejandro/eng-123-title`. A branch without an id needs `--ticket`. The ticket text is the Linear title plus description, loaded with the GraphQL `issue(id:)` query. Issue comments are not included.
 
 ## Tests
 

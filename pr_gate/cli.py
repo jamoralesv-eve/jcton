@@ -16,22 +16,28 @@ from pr_gate.agent import required_api_key
 from pr_gate.collect import CollectRequest
 from pr_gate.collect import GateInputs
 from pr_gate.collect import gather
+from pr_gate.collect import resolve_ticket_id
 from pr_gate.decide import EXIT_ERROR
 from pr_gate.decide import EXIT_PASS
 from pr_gate.decide import distance_of
 from pr_gate.decide import exit_code
 from pr_gate.decide import render_report
 from pr_gate.errors import GateError
+from pr_gate.pull_request import prepare_pull_request
 from pr_gate.run import evaluate
 
 _USAGE = """
 ejemplos:
   jcton
   jcton --ticket ENG-123
+  jcton https://github.com/org/repo/pull/123
+  jcton https://github.com/org/repo/pull/123 --print-inputs
   jcton --threshold 0.5 --report reports/custom.md
   jcton --print-inputs
 
-Corre jcton desde el checkout de la rama a revisar.
+Con un link de pull request, jcton hace checkout de esa rama y toma el ticket del nombre.
+Sin link, corre jcton desde el checkout de la rama a revisar.
+El link necesita el comando gh, autenticado, dentro de un clon de ese repositorio.
 LINEAR_API_KEY es obligatorio. El modelo por defecto también pide ANTHROPIC_API_KEY.
 DISTANCE_THRESHOLD sustituye el umbral de 0.5 cuando se omite --threshold.
 """
@@ -75,9 +81,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _execute(args: argparse.Namespace) -> int:
+    _prepare_branch(args)
     if args.print_inputs:
         return _show_inputs(args)
     return _evaluate_pr(args)
+
+
+def _prepare_branch(args: argparse.Namespace) -> None:
+    if not args.pr:
+        return
+    prepared = prepare_pull_request(args.pr)
+    args.ticket = resolve_ticket_id(args.ticket or prepared.ticket_id, prepared.branch)
+    print(f"branch: {prepared.branch}")
+    print(f"ticket: {args.ticket}")
 
 
 def _show_inputs(args: argparse.Namespace) -> int:
@@ -100,6 +116,11 @@ def _parser() -> argparse.ArgumentParser:
         description="Compara la rama actual con su ticket de Linear.",
         epilog=_USAGE,
         formatter_class=_UsageFormat,
+    )
+    parser.add_argument(
+        "pr",
+        nargs="?",
+        help="Link del pull request. Hace checkout y toma el ticket del nombre de la rama.",
     )
     parser.add_argument("--ticket", help="Issue de Linear, por ejemplo ENG-123.")
     parser.add_argument(
