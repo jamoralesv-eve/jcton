@@ -25,6 +25,13 @@ from pr_gate.decide import render_report
 from pr_gate.errors import GateError
 from pr_gate.pull_request import prepare_pull_request
 from pr_gate.run import evaluate
+from pr_gate.structdiff import SPECS
+from pr_gate.structdiff import analyze
+from pr_gate.structdiff import compare_files
+from pr_gate.structdiff import lang_for
+from pr_gate.structdiff import llm_context
+from pr_gate.structdiff import render_markdown
+from pr_gate.structdiff import to_json
 
 _USAGE = """
 ejemplos:
@@ -34,6 +41,9 @@ ejemplos:
   jcton https://github.com/org/repo/pull/123 --print-inputs
   jcton --threshold 0.5 --report reports/custom.md
   jcton --print-inputs
+  jcton structdiff main HEAD
+  jcton structdiff main HEAD --json
+  jcton structdiff --files viejo.py nuevo.py
 
 Con un link de pull request, jcton hace checkout de esa rama y toma el ticket del nombre.
 Sin link, corre jcton desde el checkout de la rama a revisar.
@@ -70,14 +80,34 @@ def print_header() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    print_header()
     try:
-        return _execute(args)
+        return _dispatch(_argv(argv))
     except GateError as error:
         return _fail(str(error))
     except Exception as error:
         return _fail(f"{type(error).__name__}: {error}")
+
+
+def _argv(argv: list[str] | None) -> list[str]:
+    if argv is None:
+        return sys.argv[1:]
+    return list(argv)
+
+
+def _dispatch(argv: list[str]) -> int:
+    if _is_structdiff(argv):
+        return _structdiff(argv[1:])
+    return _gate(argv)
+
+
+def _is_structdiff(argv: list[str]) -> bool:
+    return bool(argv) and argv[0] == "structdiff"
+
+
+def _gate(argv: list[str]) -> int:
+    args = _parser().parse_args(argv)
+    print_header()
+    return _execute(args)
 
 
 def _execute(args: argparse.Namespace) -> int:
@@ -228,6 +258,73 @@ def _write_json(path: Path, verdict: dict) -> None:
 
 def _show_report(report: str) -> None:
     Console().print(Markdown(report))
+
+
+def _structdiff(argv: list[str]) -> int:
+    args = _structdiff_parser().parse_args(argv)
+    _emit_structdiff(args, _structdiff_reports(args))
+    return EXIT_PASS
+
+
+def _structdiff_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="jcton structdiff",
+        description="Diff estructural multilenguaje entre revisiones de git.",
+    )
+    parser.add_argument("base", nargs="?")
+    parser.add_argument("head", nargs="?", default="HEAD")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--llm-context",
+        action="store_true",
+        help="Imprime solo el contexto compacto de los archivos que requieren LLM.",
+    )
+    parser.add_argument("--files", nargs=2, metavar=("VIEJO", "NUEVO"))
+    parser.add_argument("--lang", choices=sorted(SPECS), help="Forzar lenguaje con --files.")
+    return parser
+
+
+def _structdiff_reports(args: argparse.Namespace) -> list:
+    if args.files:
+        return [_file_report(args)]
+    _require_base(args)
+    return analyze(args.base, args.head, args.repo)
+
+
+def _file_report(args: argparse.Namespace):
+    return compare_files(args.files[0], args.files[1], _structdiff_lang(args))
+
+
+def _structdiff_lang(args: argparse.Namespace) -> str:
+    lang = args.lang or lang_for(args.files[1])
+    if lang:
+        return lang
+    raise GateError("No reconozco el lenguaje; usa --lang")
+
+
+def _require_base(args: argparse.Namespace) -> None:
+    if args.base:
+        return
+    raise GateError("Indica BASE (y opcionalmente HEAD), o usa --files")
+
+
+def _emit_structdiff(args: argparse.Namespace, reports: list) -> None:
+    if args.json:
+        print(to_json(reports))
+        return
+    if args.llm_context:
+        print(_llm_text(reports))
+        return
+    base = args.base or args.files[0]
+    _show_report(render_markdown(reports, base, args.head))
+
+
+def _llm_text(reports: list) -> str:
+    parts = [llm_context(report) for report in reports if report.needs_llm]
+    if parts:
+        return "\n\n---\n\n".join(parts)
+    return "Ningún archivo requiere LLM."
 
 
 def _linear_key() -> str:

@@ -272,6 +272,50 @@ class CliTests(unittest.TestCase):
         self.assertIn("--print-inputs", text)
         self.assertIn("jcton --ticket ENG-123", text)
         self.assertIn("https://github.com/org/repo/pull/123", text)
+        self.assertIn("jcton structdiff main HEAD", text)
+
+    def test_structdiff_help(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as raised:
+                main(["structdiff", "-h"])
+        self.assertEqual(raised.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("usage: jcton structdiff", text)
+        self.assertIn("--files", text)
+        self.assertIn("--json", text)
+
+    def test_structdiff_requires_a_base(self) -> None:
+        code, printed = _quiet(lambda: main(["structdiff"]))
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("BASE", printed)
+
+    def test_structdiff_compares_two_files(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            old = Path(raw) / "old.py"
+            new = Path(raw) / "new.py"
+            old.write_text("def kept():\n    return 1\n")
+            new.write_text("def kept():\n    return 1\n\ndef added():\n    return 2\n")
+            code, printed = _quiet(lambda: main(["structdiff", "--files", str(old), str(new)]))
+        self.assertEqual(code, EXIT_PASS)
+        self.assertIn("added", printed)
+        self.assertNotIn("**", printed)
+
+    def test_structdiff_can_print_json(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO) as raw:
+            old = Path(raw) / "old.py"
+            new = Path(raw) / "new.py"
+            old.write_text("x = 1\n")
+            new.write_text("x = 2\n")
+            code, printed = _quiet(lambda: main([
+                "structdiff", "--json", "--files", str(old), str(new),
+            ]))
+        self.assertEqual(code, 0)
+        self.assertIn('"path"', printed)
+
+    def test_structdiff_has_no_main(self) -> None:
+        import pr_gate.structdiff as structdiff
+        self.assertFalse(hasattr(structdiff, "main"))
 
     def test_missing_linear_key(self) -> None:
         with patch.dict(os.environ, {"LINEAR_API_KEY": ""}):

@@ -35,6 +35,7 @@ Both agents use LiteLLM at temperature 0, with `include_contents="none"`, so eac
 | `pr_gate/prompts.py` | Loads `pr_gate/prompts/*.md`. `{identifier}` is session state; other braces stay literal |
 | `pr_gate/run.py` | `Runner` and an in-memory session |
 | `pr_gate/decide.py` | Threshold and the report |
+| `pr_gate/structdiff.py` | Structural diff. Invoked only as `jcton structdiff` |
 
 `pr_gate/__init__.py` imports the agent module so `adk web` can load `root_agent` later.
 
@@ -80,6 +81,19 @@ jcton https://github.com/org/repo/pull/123
 
 The diff is the change on the current branch against the remote default branch (`origin/HEAD`). It writes `reports/<fecha>-<rama>-<ticket>.md` and prints the same report. `--report` sets a different path. The comparison JSON and a copy of the report also go to `$TMPDIR/pr_gate/<fecha>-<rama>-<ticket>/`.
 
+## Structural diff
+
+`jcton structdiff` compares two git revisions, or two files, with tree-sitter. It does not call the model or Linear. Python, JavaScript, TypeScript, Go, and Java are recognized. The markdown report is printed in the terminal.
+
+```bash
+jcton structdiff main HEAD
+jcton structdiff main HEAD --json
+jcton structdiff main HEAD --llm-context
+jcton structdiff --files old.py new.py
+```
+
+`HEAD` is the default second revision. `--repo` sets the git checkout. `--json` prints the same facts as JSON. `--llm-context` prints only the files whose changes are large enough to need an explanation. `--lang` forces the language when `--files` is used and the extension is not recognized.
+
 ## What gets collected
 
 The diff is `git diff origin/<default>...HEAD`, excluding lockfiles and `*.snap`, and cut at 60,000 characters. `<default>` is the branch `origin/HEAD` points at.
@@ -92,4 +106,4 @@ When a link is passed, the Linear issue id comes from the pull request branch na
 python -m unittest tests.test_pr_gate
 ```
 
-The tests cover ticket resolution, a real git diff that drops lockfiles, Linear response parsing, the threshold, and the CLI exit codes. They do not call the model or Linear.
+The tests cover ticket resolution, a real git diff that drops lockfiles, Linear response parsing, the threshold, the CLI exit codes, and `jcton structdiff` on two files. They do not call the model or Linear.
