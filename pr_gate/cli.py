@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import tempfile
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,11 @@ from pr_gate.decide import exit_code
 from pr_gate.decide import render_report
 from pr_gate.errors import GateError
 from pr_gate.pull_request import prepare_pull_request
+from pr_gate.recap import facts_json
+from pr_gate.recap import gather_recap
+from pr_gate.recap_html import render_recap
+from pr_gate.recap_notes import load_notes
+from pr_gate.recap_notes import template
 from pr_gate.run import evaluate
 from pr_gate.structdiff import SPECS
 from pr_gate.structdiff import analyze
@@ -44,6 +50,8 @@ ejemplos:
   jcton structdiff main HEAD
   jcton structdiff main HEAD --json
   jcton structdiff --files viejo.py nuevo.py
+  jcton recap origin/main HEAD --facts
+  jcton recap origin/main HEAD --notes notas.json --open
 
 Con un link de pull request, jcton hace checkout de esa rama y toma el ticket del nombre.
 Sin link, corre jcton desde el checkout de la rama a revisar.
@@ -97,11 +105,17 @@ def _argv(argv: list[str] | None) -> list[str]:
 def _dispatch(argv: list[str]) -> int:
     if _is_structdiff(argv):
         return _structdiff(argv[1:])
+    if _is_recap(argv):
+        return _recap(argv[1:])
     return _gate(argv)
 
 
 def _is_structdiff(argv: list[str]) -> bool:
     return bool(argv) and argv[0] == "structdiff"
+
+
+def _is_recap(argv: list[str]) -> bool:
+    return bool(argv) and argv[0] == "recap"
 
 
 def _gate(argv: list[str]) -> int:
@@ -325,6 +339,51 @@ def _llm_text(reports: list) -> str:
     if parts:
         return "\n\n---\n\n".join(parts)
     return "Ningún archivo requiere LLM."
+
+
+def _recap(argv: list[str]) -> int:
+    args = _recap_parser().parse_args(argv)
+    facts = gather_recap(args.base, args.head, args.repo)
+    if args.facts:
+        print(json.dumps(facts_json(facts), ensure_ascii=False, indent=2))
+        return EXIT_PASS
+    if args.template:
+        print(json.dumps(template([f.path for f in facts.files]), ensure_ascii=False, indent=2))
+        return EXIT_PASS
+    notes = load_notes(args.notes, facts.paths())
+    path = _recap_destination(args, facts.head_sha)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_recap(facts, notes), encoding="utf-8")
+    for problem in notes.problems:
+        print(f"aviso: {problem}", file=sys.stderr)
+    print(path)
+    if args.open:
+        webbrowser.open(path.resolve().as_uri())
+    return EXIT_PASS
+
+
+def _recap_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="jcton recap",
+        description="Recap visual de un cambio en un solo HTML local, sin red.",
+    )
+    parser.add_argument("base", help="Revisión base, por ejemplo origin/main.")
+    parser.add_argument("head", nargs="?", default="HEAD")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--notes", help="JSON con la narrativa del agente.")
+    parser.add_argument("--out", help="Ruta del HTML. Por defecto, en la carpeta temporal.")
+    parser.add_argument("--open", action="store_true", help="Abre el HTML en el navegador.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--facts", action="store_true", help="Imprime los hechos en JSON, sin HTML.")
+    group.add_argument("--template", action="store_true", help="Imprime un esqueleto de notas.")
+    return parser
+
+
+def _recap_destination(args: argparse.Namespace, head_sha: str) -> Path:
+    if args.out:
+        return Path(args.out)
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return _temp_root() / "recaps" / f"{stamp}-{head_sha[:10]}.html"
 
 
 def _linear_key() -> str:

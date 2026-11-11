@@ -36,6 +36,9 @@ Both agents use LiteLLM at temperature 0, with `include_contents="none"`, so eac
 | `pr_gate/run.py` | `Runner` and an in-memory session |
 | `pr_gate/decide.py` | Threshold and the report |
 | `pr_gate/structdiff.py` | Structural diff. Invoked only as `jcton structdiff` |
+| `pr_gate/recap.py` | Facts and risk score for `jcton recap`. No model, no network |
+| `pr_gate/recap_notes.py` | Loads and validates the agent's notes against the diff |
+| `pr_gate/recap_html.py` | Renders the single offline HTML page |
 
 `pr_gate/__init__.py` imports the agent module so `adk web` can load `root_agent` later.
 
@@ -94,6 +97,24 @@ jcton structdiff --files old.py new.py
 
 `HEAD` is the default second revision. `--repo` sets the git checkout. `--json` prints the same facts as JSON. `--llm-context` prints only the files whose changes are large enough to need an explanation. `--lang` forces the language when `--files` is used and the extension is not recognized.
 
+## Visual recap
+
+`jcton recap` writes one self-contained HTML file for reviewing a change. It makes no network calls and loads no external fonts, scripts, or styles; the page carries a `default-src 'none'` Content Security Policy.
+
+```bash
+jcton recap origin/main HEAD --facts       # facts as JSON, no HTML
+jcton recap origin/main HEAD --template    # notes skeleton with the diff's paths
+jcton recap origin/main HEAD --notes notes.json --open
+```
+
+Python computes the facts: the diff with line numbers and word-level highlights, the `structdiff` changes, the commits, and a risk score per file. Each point of the score comes with the signal that produced it: sensitive paths (auth, secrets, migrations, CI, dependencies), size, removed symbols, changed signatures, heavily rewritten bodies, and patterns in added lines (hardcoded credentials, disabled TLS, `eval`/`shell=True`, destructive SQL, silenced linters, skipped tests, fewer assertions). The score orders the reading. It does not approve anything.
+
+`--notes` adds the agent's narrative: summary, intent, review order, risks with `path` and `line`, per-file notes, what was verified, what was not, and questions. Python validates it against the diff. A path that is not in the diff is shown in red and printed as `aviso:` on stderr, never silently dropped. The page labels the narrative as written by a model and keeps it apart from the computed sections.
+
+The page has a unified or split view, a "reviewed" checkbox per file with progress saved in the browser, and a filter for low-risk files. Without `--out`, the file goes to `$TMPDIR/pr_gate/recaps/`.
+
+The `pr-visual-recap` skill in `.claude/skills/` tells a coding agent how to run the whole review: check out the PR, read the facts, investigate on its own before trusting the PR description, write the notes, and render the page. To use it from other repositories, copy that folder to `~/.claude/skills/`.
+
 ## What gets collected
 
 The diff is `git diff origin/<default>...HEAD`, excluding lockfiles and `*.snap`, and cut at 60,000 characters. `<default>` is the branch `origin/HEAD` points at.
@@ -103,7 +124,7 @@ When a link is passed, the Linear issue id comes from the pull request branch na
 ## Tests
 
 ```bash
-python -m unittest tests.test_pr_gate
+python -m unittest tests.test_pr_gate tests.test_recap
 ```
 
-The tests cover ticket resolution, a real git diff that drops lockfiles, Linear response parsing, the threshold, the CLI exit codes, and `jcton structdiff` on two files. They do not call the model or Linear.
+The tests cover ticket resolution, a real git diff that drops lockfiles, Linear response parsing, the threshold, the CLI exit codes, and `jcton structdiff` on two files. `tests.test_recap` covers diff parsing, the risk signals, note validation, HTML escaping, and the `recap` command on a real git repository. They do not call the model or Linear.
